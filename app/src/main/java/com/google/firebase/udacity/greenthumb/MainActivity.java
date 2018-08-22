@@ -1,8 +1,12 @@
 package com.google.firebase.udacity.greenthumb;
 
+import android.content.ContentValues;
 import android.content.DialogInterface;
+import android.content.Intent;
 import android.database.Cursor;
+import android.net.Uri;
 import android.os.Bundle;
+import android.support.annotation.NonNull;
 import android.support.v4.app.LoaderManager;
 import android.support.v4.content.CursorLoader;
 import android.support.v4.content.Loader;
@@ -12,24 +16,47 @@ import android.support.v7.widget.DividerItemDecoration;
 import android.support.v7.widget.LinearLayoutManager;
 import android.support.v7.widget.RecyclerView;
 import android.support.v7.widget.Toolbar;
+import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
 
+import com.google.android.gms.appinvite.AppInvite;
+import com.google.android.gms.appinvite.AppInviteInvitationResult;
+import com.google.android.gms.appinvite.AppInviteReferral;
+import com.google.android.gms.common.ConnectionResult;
+import com.google.android.gms.common.api.GoogleApiClient;
+import com.google.android.gms.common.api.ResultCallback;
+import com.google.android.gms.tasks.OnFailureListener;
+import com.google.android.gms.tasks.OnSuccessListener;
 import com.google.firebase.crash.FirebaseCrash;
+import com.google.firebase.remoteconfig.FirebaseRemoteConfig;
+import com.google.firebase.remoteconfig.FirebaseRemoteConfigSettings;
 import com.google.firebase.udacity.greenthumb.data.Analytics;
 import com.google.firebase.udacity.greenthumb.data.DbContract.PlantEntry;
 import com.google.firebase.udacity.greenthumb.data.Preferences;
 
+import java.util.HashMap;
+import java.util.Map;
+
 /**
  * {@link MainActivity} displays a list of plants to buy.
  */
-public class MainActivity extends AppCompatActivity implements LoaderManager.LoaderCallbacks<Cursor> {
+public class MainActivity extends AppCompatActivity
+        implements LoaderManager.LoaderCallbacks<Cursor>, GoogleApiClient.OnConnectionFailedListener{
 
+    private static final String TAG = "MainActivity";
     private static final int PLANT_LOADER = 1;
 
     PlantAdapter mAdapter;
 
     private int mRatingChoice = -1;
+
+    private FirebaseRemoteConfig mFirebaseRemoteConfig;
+
+    private static final String PLANT_DESCRIPTIONS_KEY = "plant_description";
+    private static final String DEFAULT_PLANT_DESCRIPTIONS_LEVEL = "basic";
+
+    private GoogleApiClient mGoogleApiClient;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -55,6 +82,27 @@ public class MainActivity extends AppCompatActivity implements LoaderManager.Loa
 
         //fatalError();
         //reportNonfatalError();
+
+        mFirebaseRemoteConfig = FirebaseRemoteConfig.getInstance();
+        FirebaseRemoteConfigSettings configSetting = new FirebaseRemoteConfigSettings.Builder()
+                .setDeveloperModeEnabled(BuildConfig.DEBUG)
+                .build();
+        mFirebaseRemoteConfig.setConfigSettings(configSetting);
+
+        Map<String, Object> defaultConfigMap = new HashMap<>();
+        defaultConfigMap.put(PLANT_DESCRIPTIONS_KEY, DEFAULT_PLANT_DESCRIPTIONS_LEVEL);
+        mFirebaseRemoteConfig.setDefaults(defaultConfigMap  );
+
+
+        fetchConfig();
+
+        //Build GoogleApiClient with API for receiving deep links
+        mGoogleApiClient = new GoogleApiClient.Builder(this)
+                .enableAutoManage(this, this)
+                .addApi(AppInvite.API)
+                .build();
+
+        handleDynamicLink();
     }
 
     @Override
@@ -167,5 +215,85 @@ public class MainActivity extends AppCompatActivity implements LoaderManager.Loa
 
     public void reportNonfatalError(){
         FirebaseCrash.report(new Exception("Reporting a non-fatal error"));
+    }
+
+    private void fetchConfig() {
+        long cacheExpiration = 3600; // 1 hour in seconds
+        // If developer mode is enabled reduce cacheExpiration to 0 so that each fetch goes to the
+        // server. This should not be used in release builds.
+        if (mFirebaseRemoteConfig.getInfo().getConfigSettings().isDeveloperModeEnabled()) {
+            cacheExpiration = 0;
+        }
+        mFirebaseRemoteConfig.fetch(cacheExpiration)
+                .addOnSuccessListener(new OnSuccessListener<Void>() {
+                    @Override
+                    public void onSuccess(Void aVoid) {
+                        // Make the fetched config available
+                        // via FirebaseRemoteConfig get<type> calls, e.g., getLong, getString.
+                        mFirebaseRemoteConfig.activateFetched();
+                        // Update the plant descriptions based on the retrieved value
+                        // for plant_descriptions
+                        applyRetrievedPlantDescriptionsLevel();
+                    }
+                })
+                .addOnFailureListener(new OnFailureListener() {
+                    @Override
+                    public void onFailure(@NonNull Exception e) {
+                        // An error occurred when fetching the config.
+                        // Update the plant descriptions based on the retrieved value
+                        // for plant_descriptions
+                        applyRetrievedPlantDescriptionsLevel();
+                    }
+                });
+    }
+    private void applyRetrievedPlantDescriptionsLevel() {
+        String plantDescriptionsLevel = mFirebaseRemoteConfig.getString(PLANT_DESCRIPTIONS_KEY);
+        Log.d("MainActivity", "plant_descriptions = " + plantDescriptionsLevel);
+        String[] plantDescriptions;
+        if (plantDescriptionsLevel.equals(DEFAULT_PLANT_DESCRIPTIONS_LEVEL)) {
+            plantDescriptions = getResources().getStringArray(R.array.plant_descriptions);
+        } else {
+            plantDescriptions = getResources().getStringArray(R.array.plant_descriptions_advanced);
+        }
+        for (int i = 0; i < plantDescriptions.length; i++) {
+            int plantId = i + 1;
+            ContentValues values = new ContentValues();
+            values.put(PlantEntry.COLUMN_DESCRIPTION, plantDescriptions[i]);
+            getContentResolver().update(
+                    PlantEntry.CONTENT_URI,
+                    values,
+                    PlantEntry._ID + " = ?",
+                    new String[] { String.valueOf(plantId) });
+        }
+    }
+
+    @Override
+    public void onConnectionFailed(@NonNull ConnectionResult connectionResult) {
+        Log.e(TAG, "GoogleApiClient connection failed: " + connectionResult.getErrorMessage());
+    }
+    private void handleDynamicLink() {
+        // Check if this app was launched from a deep link. Setting autoLaunchDeepLink to true
+        // would automatically launch the deep link if one is found.
+        boolean autoLaunchDeepLink = false;
+        AppInvite.AppInviteApi.getInvitation(mGoogleApiClient, this, autoLaunchDeepLink)
+                .setResultCallback(
+                        new ResultCallback<AppInviteInvitationResult>() {
+                            @Override
+                            public void onResult(@NonNull AppInviteInvitationResult result) {
+                                if (result.getStatus().isSuccess()) {
+                                    // Extract deep link from Intent
+                                    Intent intent = result.getInvitationIntent();
+                                    String deepLink = AppInviteReferral.getDeepLink(intent);
+                                    // Handle the deep link. For example, open the linked
+                                    // content, or apply promotional credit to the user's
+                                    // account.
+                                    Uri uri = Uri.parse(deepLink);
+                                    int plantId = Integer.parseInt(uri.getLastPathSegment());
+                                    PlantDetailActivity.startActivity(MainActivity.this, plantId);
+                                } else {
+                                    Log.d(TAG, "getInvitation: no deep link found.");
+                                }
+                            }
+                        });
     }
 }
